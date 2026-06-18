@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import os
+from pathlib import Path
 import re
 import time
 from datetime import datetime
@@ -20,13 +21,13 @@ import requests
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 except ImportError:
     pass
 
 HS_TOKEN = os.environ["HUBSPOT_API_KEY"]
 EXA_TOKEN = os.environ["EXA_API_KEY"]
-EXCEL_FILE = os.getenv("EXCEL_FILE", "/Users/anmolsam/Downloads/HC_CE_Renewal_Nursing_Specialty_3.xlsx")
+EXCEL_FILE = os.environ.get("CSV_FILE") or os.environ.get("EXCEL_FILE") or (_ for _ in ()).throw(SystemExit("ERROR: CSV_FILE not set in .env"))
 
 HS_BASE  = "https://api.hubapi.com"
 EXA_BASE = "https://api.exa.ai"

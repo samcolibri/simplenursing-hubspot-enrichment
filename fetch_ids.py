@@ -9,7 +9,7 @@ HS_TOKEN = os.environ["HUBSPOT_API_KEY"]
 HS_H = {"Authorization": f"Bearer {HS_TOKEN}", "Content-Type": "application/json"}
 HS_BASE = "https://api.hubapi.com"
 
-with open("/Users/anmolsam/Downloads/HC_CE_Renewal_Nursing_Specialty_3(Nursing_Flat_File).csv", newline="") as f:
+with open(_csv_file(), newline="") as f:
     rows = list(csv.reader(f))
 field_names = rows[1]
 records = [dict(zip(field_names, r)) for r in rows[2:]]

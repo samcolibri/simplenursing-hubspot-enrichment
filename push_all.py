@@ -4,15 +4,24 @@ Creates missing properties, batch-upserts all 20 contacts.
 """
 import csv, os, time, calendar
 from datetime import datetime
+from pathlib import Path
 import requests
 
+_env_path = Path(__file__).parent / ".env"
 try:
-    from dotenv import load_dotenv; load_dotenv()
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=_env_path)
 except ImportError:
     pass
 
-HS_TOKEN  = os.environ["HUBSPOT_API_KEY"]
-CSV_FILE  = "/Users/anmolsam/Downloads/HC_CE_Renewal_Nursing_Specialty_3(Nursing_Flat_File).csv"
+def _require_env(key):
+    v = os.environ.get(key)
+    if not v:
+        raise SystemExit(f"ERROR: {key} not set. Copy .env.example to .env and fill it in.")
+    return v
+
+HS_TOKEN  = _require_env("HUBSPOT_API_KEY")
+CSV_FILE  = os.environ.get("CSV_FILE") or os.environ.get("EXCEL_FILE") or (_ for _ in ()).throw(SystemExit("ERROR: CSV_FILE not set in .env"))
 HS_BASE   = "https://api.hubapi.com"
 HS_H      = {"Authorization": f"Bearer {HS_TOKEN}", "Content-Type": "application/json"}
 GROUP     = "sn_enrichment"

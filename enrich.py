@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import os
+from pathlib import Path
 import sys
 import time
 import calendar
@@ -24,13 +25,13 @@ import requests
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 except ImportError:
     pass
 
 HS_TOKEN = os.environ["HUBSPOT_API_KEY"]
 FE_TOKEN = os.environ["FULLENRICH_API_KEY"]
-EXCEL_FILE = os.getenv("EXCEL_FILE", "/Users/anmolsam/Downloads/HC_CE_Renewal_Nursing_Specialty_3.xlsx")
+EXCEL_FILE = os.environ.get("CSV_FILE") or os.environ.get("EXCEL_FILE") or (_ for _ in ()).throw(SystemExit("ERROR: CSV_FILE not set in .env"))
 
 HS_BASE = "https://api.hubapi.com"
 FE_BASE = "https://app.fullenrich.com/api/v1"

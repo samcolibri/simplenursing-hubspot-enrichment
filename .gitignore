@@ -6,3 +6,6 @@ __pycache__/
 *.xlsx
 .harness-next/
 .DS_Store
+
+# Added by ggshield
+.cache_ggshield

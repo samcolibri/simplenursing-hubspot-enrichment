@@ -74,7 +74,7 @@ MAPPING = {
     "nurse_professions":  "sn_nurse_professions",
 }
 
-with open("/Users/anmolsam/Downloads/HC_CE_Renewal_Nursing_Specialty_3(Nursing_Flat_File).csv", newline="") as f:
+with open(_csv_file(), newline="") as f:
     rows = list(csv.reader(f))
 field_names = rows[1]
 records = [dict(zip(field_names, r)) for r in rows[2:]]

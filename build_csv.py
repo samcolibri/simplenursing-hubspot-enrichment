@@ -9,8 +9,8 @@ HS_TOKEN = os.environ["HUBSPOT_API_KEY"]
 HS_H = {"Authorization": f"Bearer {HS_TOKEN}", "Content-Type": "application/json"}
 HS_BASE = "https://api.hubapi.com"
 
-CSV_IN  = "/Users/anmolsam/Downloads/HC_CE_Renewal_Nursing_Specialty_3(Nursing_Flat_File).csv"
-CSV_OUT = "/Users/anmolsam/Downloads/HC_CE_Renewal_Nursing_Specialty_3(Nursing_Flat_File).csv"
+CSV_IN  = _csv_file()
+CSV_OUT = _csv_file()
 
 # Exact CSV col index -> HubSpot property name (57 columns, in order)
 HS_PROP_ROW = [
