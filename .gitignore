@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.csv
+*.xlsx
+.harness-next/
+.DS_Store
