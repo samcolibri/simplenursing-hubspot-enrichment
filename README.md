@@ -1,257 +1,496 @@
-# SimpleNursing HubSpot Enrichment Pipeline
+# SimpleNursing → HubSpot Enrichment Pipeline
 
-> **Hey Aliza 👋** — this README is written specifically for you. It covers everything we built, every decision we made, every API we used, and exactly how to run the whole thing from your laptop. Read it top to bottom once before you touch any code.
+> **Welcome, Ms. John.** This README is your complete guide. Read it once top-to-bottom before touching any code. Every decision, every API, every bug we hit — it's all documented here. By the end, you'll be able to run this entire pipeline yourself.
 
----
+<br>
 
 ## Table of Contents
 
-1. [What This Project Does](#1-what-this-project-does)
-2. [Why We Built It](#2-why-we-built-it)
-3. [Architecture Overview](#3-architecture-overview)
-4. [Local Setup](#4-local-setup)
-5. [Data Source: The Excel / CSV File](#5-data-source-the-excel--csv-file)
-6. [HubSpot Setup](#6-hubspot-setup)
-7. [Step 1 — Run the Main Enrichment Pipeline](#7-step-1--run-the-main-enrichment-pipeline)
-8. [Step 2 — Run Exa Web Enrichment](#8-step-2--run-exa-web-enrichment)
-9. [Step 3 — Verify Everything](#9-step-3--verify-everything)
-10. [Step 4 — Update the CSV with HubSpot IDs](#10-step-4--update-the-csv-with-hubspot-ids)
-11. [All HubSpot Properties We Created](#11-all-hubspot-properties-we-created)
-12. [CSV Column → HubSpot Property Mapping](#12-csv-column--hubspot-property-mapping)
-13. [APIs Used — Full Reference](#13-apis-used--full-reference)
-14. [Phase 2: S3 Pipeline (Coming Next)](#14-phase-2-s3-pipeline-coming-next)
-15. [Troubleshooting](#15-troubleshooting)
+| # | Section |
+|---|---|
+| 1 | [What This Project Does](#1-what-this-project-does) |
+| 2 | [Why We Built It](#2-why-we-built-it) |
+| 3 | [Full Architecture](#3-full-architecture) |
+| 4 | [Phase 1 Workflow — Step by Step](#4-phase-1-workflow--step-by-step) |
+| 5 | [Local Setup](#5-local-setup) |
+| 6 | [Understanding the Data File](#6-understanding-the-data-file) |
+| 7 | [HubSpot Setup](#7-hubspot-setup) |
+| 8 | [Run the Pipeline](#8-run-the-pipeline) |
+| 9 | [HubSpot Properties Reference](#9-hubspot-properties-reference) |
+| 10 | [CSV → HubSpot Mapping](#10-csv--hubspot-mapping) |
+| 11 | [APIs — Full Reference](#11-apis--full-reference) |
+| 12 | [Phase 2 — S3 at Scale](#12-phase-2--s3-at-scale) |
+| 13 | [Troubleshooting](#13-troubleshooting) |
+| 14 | [People & Contacts](#14-people--contacts) |
 
 ---
+
+<br>
 
 ## 1. What This Project Does
 
-We take a flat file of **nursing customer records** (from Colibri's data warehouse) and push all the data into **HubSpot CRM** as enriched contact properties.
+Before this project, HubSpot had basic contact info for nursing customers — name, email, phone. **That's it.**
 
-Before this project, HubSpot had basic contact info (name, email, phone). After this project, every nursing contact in HubSpot has:
+Marketing could not answer questions like:
+- Which nurses have a license expiring in the next 60 days?
+- Who has already renewed? (Don't send them a renewal campaign!)
+- Who has an active membership? (Don't sell them membership they already have)
+- Which nurses are Psychiatric specialists vs. Pediatric?
 
-- Their **state nursing license** number, issue date, and renewal date
-- **CE (Continuing Education) completion** status and credits earned
-- **Membership** tier, status, start/end dates
-- **Purchase history** — what courses they bought, how much they paid
-- **Direct mail** campaign history — what mailers they received
-- **Specialty** (Psychiatric, Pediatric, Family, etc.) discovered via web search
-- **NPI number** (National Provider Identifier — the unique ID for every licensed nurse)
-- **LinkedIn profile / Doximity profile** URL
+**After this project**, every nursing contact in HubSpot has **51 enriched custom properties** covering:
 
-This lets the marketing team do **proper segmentation**. Example: don't send a membership upsell email to someone who already has an active membership. Don't send a renewal reminder to someone who already renewed. These things were impossible before because HubSpot didn't have the data.
+```
+License data     → number, state, issued date, renewal date
+CE status        → credits required, completed, CE period end
+Membership       → tier, status, start/end dates, billing cadence
+Purchase history → what they bought, order amount, payment status
+Direct mail      → what mailers they received, which campaign
+LMS engagement   → which courses, completion status, credits earned
+Specialty        → Psychiatric, Pediatric, Family, etc. (from web)
+NPI number       → National Provider Identifier (their unique nurse ID)
+```
+
+This enables the marketing team to build **segmented campaigns** — the right message to the right nurse at the right time.
 
 ---
+
+<br>
 
 ## 2. Why We Built It
 
-In a meeting with **Madhankumar Pillay** (product), **Prabhu** (senior stakeholder), and **Aliza John** (you!), the goal was defined:
+In a meeting between **Sam Chaudhary** (GTM Engineering), **Madhankumar Pillay** (Product), **Prabhu** (Senior Leadership), **Veena Anantharam** (Data Architecture), **Sandesh Segu** (Data Engineering), and **Aliza John** (you), the goal was:
 
-> "End this quarter with HubSpot having the full view of the SimpleNursing database record so marketing can do proper segmentation and targeted campaigns."
+> *"End this quarter with HubSpot having the full view of the SimpleNursing database record so marketing can do proper segmentation and targeted campaigns."*
 
-The data lives in Colibri's **Redshift data warehouse**, exported as flat files to **S3**. The decision was made to use a **file-based integration** (not a direct database connection) because:
+The customer data lives in **Colibri's Redshift data warehouse**, exported to **AWS S3** as flat CSV files.
 
-1. Redshift is a data warehouse — tight coupling is bad practice
-2. We're talking 17 million records — individual API calls won't scale
-3. File-based allows delta sync (only push what changed)
+**Key architecture decision made in the meeting:**
 
-We started with a **20-record POC** using an Excel file Aliza had, validated the full data mapping, then built the pipeline. The POC is live in the HubSpot **sandbox** (portal 51121485). The next phase scales it to the full 17M records via S3.
+> Veena: *"My preference would be a file-based integration. It's not going to be performant if you go the individual API route. We're talking about 17 million records."*
 
----
-
-## 3. Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        PHASE 1 (DONE ✓)                         │
-│                                                                  │
-│  Excel/CSV File  ──►  enrich.py  ──►  HubSpot CRM               │
-│  (20 contacts)        (maps all       (51 custom                 │
-│                        57 fields)      properties)               │
-│                                                                  │
-│  + FullEnrich  ──►  Reverse email lookup ──► LinkedIn profiles  │
-│  + Exa API     ──►  Web search per nurse ──► NPI, employer,     │
-│                                              specialty           │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                      PHASE 2 (IN PROGRESS)                       │
-│                                                                  │
-│  AWS S3 Bucket                                                   │
-│  (17M records)  ──►  s3_pipeline.py  ──►  HubSpot CRM           │
-│                       - chunked reads      (batch upsert         │
-│                       - delta logic         by email)            │
-│                       - batch upsert                             │
-│                                                                  │
-│  Orchestration: Airflow (scheduled, weekly refresh)              │
-│  S3 Access: Jira ticket COT-6043 (assigned to Prakhar Jadon)    │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Key concept — HubSpot Batch Upsert:**
-We use `POST /crm/v3/objects/contacts/batch/upsert` with `idProperty: "email"`. This means:
-- If a contact with that email **exists** → it updates them
-- If a contact with that email **doesn't exist** → it creates them
-
-One API call handles both cases. No need to check first. This is how we scale to 17M.
+So we use **S3 files → Python → HubSpot API**. No direct database connection. File-based only.
 
 ---
 
-## 4. Local Setup
+<br>
+
+## 3. Full Architecture
+
+```mermaid
+flowchart TD
+    subgraph SOURCE["📦 Data Sources"]
+        XLS["Excel / CSV File\n(POC: 20 contacts)"]
+        S3["AWS S3 Bucket\n(Full scale: 17M contacts)\ns3://prod-data-warehouse-redshift-\ncdp-data-lake-us-east-1/\nentity_matching/segmentation_flatview/"]
+    end
+
+    subgraph ENRICH["🔍 Enrichment APIs"]
+        FE["FullEnrich API\nEmail → LinkedIn profile\napp.fullenrich.com"]
+        EXA["Exa API\nWeb search → NPI, employer,\nspecialty, Doximity profile\napi.exa.ai"]
+    end
+
+    subgraph PIPELINE["⚙️ Pipeline (Python)"]
+        P1["enrich.py\nParse Excel/CSV\nCreate HubSpot properties\nBatch upsert contacts"]
+        P2["exa_enrich.py\nSearch each nurse online\nExtract NPI + employer"]
+        P3["push_all.py\nFull 57-field push\nZero-value safe"]
+        P4["verify_all.py\nConfirm all 51 properties\nexist + data matches"]
+    end
+
+    subgraph HUBSPOT["🟠 HubSpot CRM"]
+        GROUP["Property Group:\nsn_enrichment"]
+        PROPS["51 Custom Properties\nsn_license_number\nsn_ce_status\nsn_membership_status\nsn_exa_npi\n...etc"]
+        CONTACTS["20 Contacts\n(sandbox portal 51121485)"]
+    end
+
+    subgraph PHASE2["🔜 Phase 2 (Pending COT-6043)"]
+        AIRFLOW["Apache Airflow\nWeekly schedule\nDelta sync only"]
+        S3PIPE["s3_pipeline.py\nChunked reads\n100 contacts/batch\nDelta logic"]
+    end
+
+    XLS -->|"CSV_FILE in .env"| P1
+    P1 -->|"HubSpot Batch Upsert API"| CONTACTS
+    P1 -->|"FullEnrich reverse lookup"| FE
+    FE -->|"LinkedIn profiles"| P1
+    CONTACTS --> P2
+    P2 -->|"Exa neural search"| EXA
+    EXA -->|"NPI, employer, specialty"| P2
+    P2 -->|"Update contacts"| CONTACTS
+    GROUP --> PROPS --> CONTACTS
+    S3 -->|"After COT-6043 resolved"| AIRFLOW
+    AIRFLOW --> S3PIPE
+    S3PIPE -->|"Batch upsert 17M contacts"| CONTACTS
+
+    style SOURCE fill:#e8f4f8,stroke:#2196F3
+    style ENRICH fill:#fff3e0,stroke:#FF9800
+    style PIPELINE fill:#e8f5e9,stroke:#4CAF50
+    style HUBSPOT fill:#fce4ec,stroke:#E91E63
+    style PHASE2 fill:#f3e5f5,stroke:#9C27B0
+```
+
+<br>
+
+### Data Flow Summary
+
+```mermaid
+sequenceDiagram
+    participant You
+    participant Python
+    participant HubSpot
+    participant FullEnrich
+    participant Exa
+
+    You->>Python: python3 enrich.py
+    Python->>Python: Read CSV (57 columns, 20 rows)
+    Python->>HubSpot: Create property group 'sn_enrichment'
+    Python->>HubSpot: Create 30 custom properties
+    Python->>FullEnrich: POST /contact/reverse/email/bulk (20 emails)
+    FullEnrich-->>Python: Poll every 10s → FINISHED (0 LinkedIn hits — B2C emails)
+    Python->>HubSpot: POST /crm/v3/objects/contacts/batch/upsert (20 contacts)
+    HubSpot-->>Python: 200 OK — 19 created, 1 updated
+
+    You->>Python: python3 exa_enrich.py
+    loop For each of 20 nurses
+        Python->>Exa: POST /search (name + state + nurse)
+        Exa-->>Python: NPI registry URL, Doximity profile, employer
+        Python->>Python: Extract NPI number, specialty, employer
+    end
+    Python->>HubSpot: POST /crm/v3/objects/contacts/batch/upsert (20 contacts)
+    HubSpot-->>Python: 200 OK — all 20 updated
+
+    You->>Python: python3 verify_all.py
+    Python->>HubSpot: GET /crm/v3/properties/contacts (check 51 props exist)
+    Python->>HubSpot: GET each contact (verify data matches CSV)
+    Python-->>You: ✓ All 51 properties exist. All 20 contacts verified.
+```
+
+---
+
+<br>
+
+## 4. Phase 1 Workflow — Step by Step
+
+```mermaid
+flowchart LR
+    A([🗂️ Start:\nGet CSV file\nfrom Sam]) --> B
+
+    subgraph SETUP["Step 1 — Setup"]
+        B["git clone repo"]
+        B --> C["uv venv --python 3.11\nsource .venv/bin/activate"]
+        C --> D["uv pip install -r requirements.txt"]
+        D --> E["cp .env.example .env\nFill in 4 API keys + CSV path"]
+    end
+
+    subgraph HUBSPOT_SETUP["Step 2 — HubSpot"]
+        F["Create HubSpot Private App\n(Settings → Integrations → Private Apps)"]
+        G["Enable required scopes:\ncrm.objects.contacts.write\ncrm.schemas.contacts.write"]
+        F --> G
+    end
+
+    subgraph RUN["Step 3 — Run Pipeline"]
+        H["python3 enrich.py --dry-run\n✓ Validate without writing"]
+        H --> I["python3 enrich.py\n✓ Create 30 properties\n✓ Upsert 20 contacts"]
+        I --> J["python3 push_all.py\n✓ Push all 57 fields\n✓ Zero-value safe"]
+        J --> K["python3 exa_enrich.py\n✓ NPI + employer + specialty\nvia Exa web search"]
+    end
+
+    subgraph VERIFY["Step 4 — Verify"]
+        L["python3 verify_all.py\n✓ 51 properties in schema\n✓ 20 contacts data matches"]
+        M["python3 build_csv.py\n✓ Adds HubSpot property row\n✓ Adds hs_id column"]
+    end
+
+    E --> F
+    G --> H
+    K --> L
+    L --> M
+    M --> N([✅ Done!\nHubSpot sandbox\nfully enriched])
+
+    style SETUP fill:#e3f2fd,stroke:#1976D2
+    style HUBSPOT_SETUP fill:#fff8e1,stroke:#F9A825
+    style RUN fill:#e8f5e9,stroke:#388E3C
+    style VERIFY fill:#fce4ec,stroke:#C2185B
+```
+
+---
+
+<br>
+
+## 5. Local Setup
 
 ### Prerequisites
-- Python 3.11+ (we use `uv` to manage the virtual environment)
-- `uv` installed: `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- Git
 
-### Clone and install
+| Tool | Why needed | Install |
+|---|---|---|
+| Python 3.11+ | Run all pipeline scripts | [python.org](https://python.org) |
+| `uv` | Fast Python package manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| Git | Clone the repo | [git-scm.com](https://git-scm.com) |
+
+### Clone and Install
 
 ```bash
+# 1. Clone
 git clone https://github.com/samcolibri/simplenursing-hubspot-enrichment.git
 cd simplenursing-hubspot-enrichment
 
-# Create virtual environment with Python 3.11
+# 2. Create virtual environment (Python 3.11 specifically)
 uv venv --python 3.11
+source .venv/bin/activate        # Mac / Linux
+# .venv\Scripts\activate         # Windows
 
-# Activate it
-source .venv/bin/activate   # Mac/Linux
-# .venv\Scripts\activate    # Windows
-
-# Install dependencies
+# 3. Install dependencies
 uv pip install -r requirements.txt
+
+# 4. Verify it worked
+python3 -c "import openpyxl, requests; print('✓ Dependencies OK')"
 ```
 
-### Configure credentials
+### Configure Your `.env`
 
 ```bash
 cp .env.example .env
 ```
 
-Now open `.env` and fill in the values. You need:
+Open `.env` and fill in these 4 values:
 
-| Variable | Where to get it |
-|---|---|
-| `HUBSPOT_API_KEY` | HubSpot → Settings → Integrations → Private Apps → your app → Access Token |
-| `FULLENRICH_API_KEY` | fullenrich.com → Dashboard → API Keys |
-| `EXA_API_KEY` | exa.ai → Dashboard → API Keys |
-| `EXCEL_FILE` | Path to `HC_CE_Renewal_Nursing_Specialty_3.xlsx` on your laptop |
+```dotenv
+HUBSPOT_API_KEY=pat-na1-...          # from HubSpot Private App
+FULLENRICH_API_KEY=xxxxxxxx-...      # from app.fullenrich.com
+EXA_API_KEY=xxxxxxxx-...             # from exa.ai
+CSV_FILE=/Users/yourname/Downloads/HC_CE_Renewal_Nursing_Specialty_3(Nursing_Flat_File).csv
+```
 
-> **Never commit your `.env` file.** It's in `.gitignore`. Never remove it from there.
+> ⚠️ **Never commit `.env`** — it contains secrets. It's already in `.gitignore`. Never remove it.
 
-### Verify setup
+### Where to get each key
 
-```bash
-python3 -c "import openpyxl, requests; print('All dependencies OK')"
+```mermaid
+flowchart TD
+    A["Need API Keys"] --> B & C & D
+
+    B["HubSpot API Key\npat-na1-..."]
+    B --> B1["1. Go to app.hubspot.com"]
+    B1 --> B2["2. Settings (gear icon)"]
+    B2 --> B3["3. Integrations → Private Apps"]
+    B3 --> B4["4. Create / open your app"]
+    B4 --> B5["5. Copy Access Token"]
+
+    C["FullEnrich Key"]
+    C --> C1["1. Go to app.fullenrich.com"]
+    C1 --> C2["2. Dashboard → API Keys"]
+    C2 --> C3["3. Copy your key"]
+
+    D["Exa Key"]
+    D --> D1["1. Go to exa.ai"]
+    D1 --> D2["2. Sign in → Dashboard"]
+    D2 --> D3["3. API Keys → Copy"]
+
+    style B fill:#ff7a59,color:#fff,stroke:#ff7a59
+    style C fill:#4a9eff,color:#fff,stroke:#4a9eff
+    style D fill:#6c5ce7,color:#fff,stroke:#6c5ce7
 ```
 
 ---
 
-## 5. Data Source: The Excel / CSV File
+<br>
 
-The source file is: `HC_CE_Renewal_Nursing_Specialty_3.xlsx`
-Sheet name: `Nursing_Flat_File`
+## 6. Understanding the Data File
 
-The file has **3 header rows** (unusual — pay attention to this):
+The source file is: **`HC_CE_Renewal_Nursing_Specialty_3(Nursing_Flat_File).csv`**
 
-| Row | Contains |
-|---|---|
-| Row 1 | **Section names** — PERSON, LICENSE, LMS ENGAGEMENT, PURCHASE HISTORY, etc. |
-| Row 2 | **CSV field names** — `resolved_person_id`, `person_name`, `person_email`, etc. |
-| Row 3 | **HubSpot property names** ← we added this row (see Step 4) |
-| Rows 4+ | **Actual data** — one row per customer |
+> 📌 This file is **not in the repo** — it contains customer PII (personal identifiable information). Ask Sam Chaudhary for a copy.
 
-Total: **57 columns** across 9 sections, **20 contacts** in the POC file.
+### File Structure
 
-The sections are:
+The file has an unusual **3-row header** (most CSVs have 1):
 
 ```
-PERSON               → who they are (name, email, phone, address)
-PERSON SOURCE        → where they came from (NetSuite, brand = Elite)
-LICENSE              → their nursing license (number, state, issue/renewal date)
-LMS ENGAGEMENT       → what courses they've taken
-PURCHASE HISTORY     → what they've bought and for how much
-MEMBERSHIP           → membership tier, status, start/end dates
-MARKETING CONSENT    → Opt-In/Out, channel, timestamp
-CE COMPLETION        → continuing education credits required/completed
-DIRECT MAIL          → what physical mailers they've received
-SPECIALTY            → nursing specialty (empty in POC file)
+Row 1  →  Section names       PERSON | | | | PERSON SOURCE | | LICENSE | ...
+Row 2  →  CSV field names     resolved_person_id | person_name | person_email | ...
+Row 3  →  HubSpot prop names  sn_person_id | firstname + lastname | email | ...  ← we added this
+Row 4+ →  Actual data         4001877 | Annmarie Shoemaker | ANNMARIE@... | ...
+```
+
+### The 9 Data Sections
+
+```mermaid
+mindmap
+  root((Nursing Flat File\n57 columns\n20 contacts))
+    PERSON
+      resolved_person_id
+      person_name
+      person_email
+      person_address
+      person_phone
+      created_at
+    PERSON SOURCE
+      source_name
+      source_platform
+      native_person_id
+      brand
+    LICENSE
+      license_number
+      state
+      profession
+      license_issued_date
+      est_renewal_date
+    LMS ENGAGEMENT
+      course_id
+      course_title
+      completion_status
+      credits_earned
+      last_activity_date
+    PURCHASE HISTORY
+      order_id
+      product_name
+      order_amount
+      order_date
+      payment_status
+    MEMBERSHIP
+      membership_tier
+      mem_status
+      mem_start_date
+      mem_end_date
+    MARKETING CONSENT
+      channel
+      consent_status
+      consent_timestamp
+    CE COMPLETION
+      ce_period
+      credits_completed
+      ce_status
+      period_end_date
+    DIRECT MAIL
+      send_channel
+      send_date
+      creative_version
+      book_title_sent
+    SPECIALTY
+      speciality
+      nurse_professions
 ```
 
 ---
 
-## 6. HubSpot Setup
+<br>
 
-### Creating a Private App (do this once)
+## 7. HubSpot Setup
 
-1. Log in to HubSpot
-2. Go to **Settings** (gear icon top right)
-3. **Integrations** → **Private Apps**
-4. Click **Create a private app**
-5. Name it: `SimpleNursing Enrichment Pipeline`
-6. Go to the **Scopes** tab and enable ALL of the following:
-   - `crm.objects.contacts.read` + `crm.objects.contacts.write`
-   - `crm.schemas.contacts.read` + `crm.schemas.contacts.write`
-   - `crm.objects.custom.read` + `crm.objects.custom.write`
-   - `crm.schemas.custom.read` + `crm.schemas.custom.write`
-   - `crm.lists.read` + `crm.lists.write`
-7. Click **Create app**
-8. Copy the **Access Token** — it starts with `pat-na1-...`
-9. Paste it into your `.env` as `HUBSPOT_API_KEY`
+### Creating a Private App (one-time setup)
 
-### What portal to use
+```mermaid
+flowchart TD
+    A["Go to app.hubspot.com"] --> B["Click Settings ⚙️"]
+    B --> C["Integrations → Private Apps"]
+    C --> D["Click 'Create a private app'"]
+    D --> E["Name it:\nSimpleNursing Enrichment Pipeline"]
+    E --> F["Click the Scopes tab"]
+    F --> G["Enable these scopes ↓"]
 
-- **Sandbox** (portal `51121485`): use for testing. This is where our POC lives.
-- **Production**: the real HubSpot with all marketing contacts. Use only after full testing.
+    G --> H["crm.objects.contacts.read\ncrm.objects.contacts.write"]
+    G --> I["crm.schemas.contacts.read\ncrm.schemas.contacts.write"]
+    G --> J["crm.objects.custom.read\ncrm.objects.custom.write\ncrm.schemas.custom.read\ncrm.schemas.custom.write"]
 
-To see which portal your token connects to:
+    H & I & J --> K["Click 'Create app'"]
+    K --> L["Copy the Access Token\npat-na1-xxxxxxxx..."]
+    L --> M["Paste into .env as\nHUBSPOT_API_KEY"]
+
+    style G fill:#fff3e0,stroke:#FF9800
+    style L fill:#e8f5e9,stroke:#4CAF50
+```
+
+### Sandbox vs Production
+
+| | Sandbox | Production |
+|---|---|---|
+| **Portal ID** | `51121485` | Different ID |
+| **Used for** | Testing (our POC is here) | Real marketing contacts |
+| **Risk** | None — safe to experiment | High — real customers |
+| **Status** | ✅ Our 20 contacts are here | ⏳ Next phase |
+
+To check which portal your token connects to:
 ```bash
 curl -s "https://api.hubapi.com/integrations/v1/me" \
-  -H "Authorization: Bearer YOUR_TOKEN" | python3 -m json.tool
+  -H "Authorization: Bearer $HUBSPOT_API_KEY" | python3 -m json.tool
+# Look for "portalId" and "accountType" in the output
 ```
-Look for `"portalId"` and `"accountType"` in the response.
 
-### How to see custom properties in HubSpot UI
+### How to See Custom Properties in HubSpot UI
 
-After running the pipeline, the properties won't show automatically on a contact record. To see them:
+After running the pipeline, custom properties won't show automatically. Here's how to view them:
 
-1. Open any contact in HubSpot
-2. Scroll to the **"About this contact"** section in the left sidebar
-3. Click **"View all properties"** at the bottom
-4. Type `sn_` in the search box
-5. All 51 enriched properties appear
+```mermaid
+flowchart LR
+    A["Open any contact\nin HubSpot"] --> B["Scroll to\n'About this contact'\nsidebar"]
+    B --> C["Click\n'View all properties'\nat bottom"]
+    C --> D["Type 'sn_' in\nthe search box"]
+    D --> E["All 51 enriched\nproperties appear ✓"]
 
-To **pin them** so they always show:
-1. Click **Actions** → **Edit properties**
-2. Search `SimpleNursing`
-3. Select the ones you want visible
-4. Save
+    E --> F{Want them\npermanently visible?}
+    F -->|Yes| G["Click Actions →\nEdit properties"]
+    G --> H["Search 'SimpleNursing'"]
+    H --> I["Select properties\nyou want pinned"]
+    I --> J["Save → they show\non every contact"]
+
+    style E fill:#e8f5e9,stroke:#4CAF50
+    style J fill:#e8f5e9,stroke:#4CAF50
+```
 
 ---
 
-## 7. Step 1 — Run the Main Enrichment Pipeline
+<br>
 
-**File:** `enrich.py`
+## 8. Run the Pipeline
 
-This script does three things:
-1. Reads the Excel file and parses all 57 columns
-2. Optionally runs FullEnrich reverse lookup (email → LinkedIn profile)
-3. Creates all custom HubSpot properties (if they don't exist yet)
-4. Batch-upserts all 20 contacts to HubSpot
+### The Scripts and What They Do
 
-### Run it
+```mermaid
+flowchart TD
+    subgraph SCRIPTS["Scripts (run in this order)"]
+        S1["📄 enrich.py\nMain pipeline\nExcel → 30 properties → 20 contacts"]
+        S2["📄 push_all.py\nFull push\nAll 57 CSV fields, zero-value safe"]
+        S3["📄 exa_enrich.py\nWeb enrichment\nNPI, employer, specialty per nurse"]
+        S4["📄 verify_all.py\nVerification\n51 schema check + 20 data check"]
+        S5["📄 build_csv.py\nCSV update\nAdd HubSpot prop row + hs_id column"]
+        S6["📄 audit.py\nAudit\nCSV field counts vs HubSpot field counts"]
+    end
 
-```bash
-# Dry run first — validates everything without writing to HubSpot
-python3 enrich.py --dry-run --skip-fullenrich
+    S1 --> S2 --> S3 --> S4 --> S5
 
-# Live run (skipping FullEnrich for speed)
-python3 enrich.py --skip-fullenrich
-
-# Full run including FullEnrich (takes ~60 seconds to poll results)
-python3 enrich.py
+    style S1 fill:#bbdefb,stroke:#1976D2
+    style S2 fill:#bbdefb,stroke:#1976D2
+    style S3 fill:#c8e6c9,stroke:#388E3C
+    style S4 fill:#fff9c4,stroke:#F9A825
+    style S5 fill:#f8bbd0,stroke:#C2185B
+    style S6 fill:#e1bee7,stroke:#7B1FA2
 ```
 
-### What you'll see
+### Step-by-Step Commands
+
+```bash
+# ── Step 1: Dry run (validates everything, writes nothing) ──────────────────
+python3 enrich.py --dry-run --skip-fullenrich
+# Expected: 20 contacts validated, 0 errors
+
+# ── Step 2: Live run — creates properties and upserts contacts ──────────────
+python3 enrich.py --skip-fullenrich
+# Expected: 30 properties created, 20 contacts upserted ✓
+
+# ── Step 3: Push ALL 57 fields (handles zero values correctly) ──────────────
+python3 push_all.py
+# Expected: 0 new properties (already exist), 20 contacts updated ✓
+
+# ── Step 4: Exa enrichment — NPI, employer, specialty ──────────────────────
+python3 exa_enrich.py
+# Expected: 20/20 contacts enriched, 6 new Exa properties added ✓
+
+# ── Step 5: Verify everything landed correctly ──────────────────────────────
+python3 verify_all.py
+# Expected: ✓ All 51 properties exist. ✓ All 20 contacts verified.
+
+# ── Step 6: Update CSV with HubSpot property names + HubSpot IDs ────────────
+python3 build_csv.py
+# Expected: CSV updated with row 3 (HubSpot props) + hubspot_id last column ✓
+```
+
+### What Good Output Looks Like
 
 ```
 ==========================================================
@@ -260,565 +499,524 @@ python3 enrich.py
 ==========================================================
 
 [13:38:14] Loaded 20 records
-[13:38:14] FullEnrich: skipped
+[13:38:14] FullEnrich: skipped (--skip-fullenrich)
 [13:38:14] Setting up HubSpot properties...
 [13:38:15] Property group 'sn_enrichment' already exists
-[13:38:15] Properties: 0 created, 30 already existed
-[13:38:15] Upserting 20 contacts (batch mode)...
+[13:38:15] Properties: 30 created, 0 already existed
+[13:38:15]
+Upserting 20 contacts (batch mode)...
 [13:38:17]   ✓ annmarieshoemaker@yahoo.com (created)
-[13:38:17]   ✓ debdawson@ymail.com (updated)
+[13:38:17]   ✓ rghanson58@gmail.com (created)
+[13:38:17]   ✓ debdawson@ymail.com (created)
 ...
 ==========================================================
   RESULTS
 ==========================================================
   Total records   : 20
-  Upserted ok     : 20
-  Errors          : 0
+  Upserted ok     : 20    ← must be 20
+  Errors          : 0     ← must be 0
+  FullEnrich hits : 0     ← OK (personal emails, B2C)
 ==========================================================
 ```
 
-### How the HubSpot batch upsert works
-
-```python
-# The key API call in enrich.py:
-requests.post(
-    "https://api.hubapi.com/crm/v3/objects/contacts/batch/upsert",
-    headers={"Authorization": f"Bearer {HS_TOKEN}"},
-    json={
-        "inputs": [
-            {
-                "id": "email@example.com",      # match by email
-                "idProperty": "email",           # tell HubSpot to match on email field
-                "properties": {                  # everything to set on this contact
-                    "email": "email@example.com",
-                    "firstname": "Jane",
-                    "sn_license_number": "RN123456",
-                    "sn_ce_status": "In Progress",
-                    ...
-                }
-            }
-        ]
-    }
-)
-```
-
-Up to 100 contacts per batch call. For 17M records, we'll chunk into batches of 100 with rate limiting.
-
 ---
 
-## 8. Step 2 — Run Exa Web Enrichment
+<br>
 
-**File:** `exa_enrich.py`
+## 9. HubSpot Properties Reference
 
-After the main pipeline, we use **Exa** (a semantic web search API) to find each nurse's professional profile online. For each nurse we search:
-- LinkedIn
-- Doximity (the "LinkedIn for doctors/nurses")
-- NPI registry (opennpi.com, npino.com, opengovus.com)
+All 51 properties live in a group called `sn_enrichment` (label: **SimpleNursing Enrichment**).
 
-We extract: **NPI number**, **employer/hospital**, **specialty**, **professional profile URL**.
+### Property Type Reference
 
-### Run it
-
-```bash
-python3 exa_enrich.py
-
-# Dry run
-python3 exa_enrich.py --dry-run
-```
-
-### How Exa works
-
-```python
-# For each nurse, we send this to https://api.exa.ai/search:
-{
-    "query": "Deborah Lynn Dawson registered nurse Texas",
-    "num_results": 5,
-    "type": "neural",
-    "include_domains": [
-        "linkedin.com", "doximity.com",
-        "opennpi.com", "opengovus.com", "npino.com"
-    ],
-    "contents": {"text": {"max_characters": 800}}
-}
-
-# Cost: ~$0.007 per search
-# For 20 nurses: ~$0.14 total
-# For 17M nurses: ~$119,000 — so Exa is for profile enrichment only, not mass data
-```
-
-**Note on FullEnrich:** FullEnrich works the other direction — give it a LinkedIn URL, it finds the email and phone. Since our nurses have Yahoo/Gmail emails, FullEnrich found 0/20 matches. Exa works better for finding NPI + employer from a name search.
-
----
-
-## 9. Step 3 — Verify Everything
-
-**File:** `verify_all.py`
-
-This script does two checks:
-1. **Schema check** — are all 51 `sn_` properties registered in HubSpot?
-2. **Data check** — do all 20 contacts have the right values matching the CSV?
-
-```bash
-python3 verify_all.py
-```
-
-Expected output:
-```
-CHECK 1: All sn_ properties exist in HubSpot schema
-  ✓ All 51 sn_ properties exist in HubSpot schema
-
-CHECK 2: All 20 contacts have data matching CSV
-  ✓ annmarieshoemaker@yahoo.com
-  ✓ rghanson58@gmail.com
-  ...
-  ALL 20 CONTACTS VERIFIED ✓
-```
-
----
-
-## 10. Step 4 — Update the CSV with HubSpot IDs
-
-**File:** `build_csv.py`
-
-This script takes the original CSV and:
-1. Adds a **new row 3** with the exact HubSpot property name for each column
-2. Adds a **`hubspot_id` column** (last column) with the real HubSpot object ID for each contact
-
-```bash
-python3 build_csv.py
-```
-
-The output CSV structure:
-```
-Row 1: PERSON | | | PERSON SOURCE | ... | HUBSPOT
-Row 2: resolved_person_id | person_name | person_email | ... | hubspot_id
-Row 3: sn_person_id | firstname + lastname | email | ... | hs_object_id  ← NEW
-Row 4: 4001877 | Annmarie Shoemaker | ANNMARIE@... | ... | 228714887471  ← data
-...
-```
-
----
-
-## 11. All HubSpot Properties We Created
-
-All properties live in a group called **`sn_enrichment`** (label: "SimpleNursing Enrichment").
-
-### PERSON / SOURCE (6 properties)
-
-| Property Name | Label | Type | Source |
-|---|---|---|---|
-| `sn_person_id` | SN: Resolved Person ID | string | CSV |
-| `sn_native_id` | SN: Native Person ID (NetSuite) | string | CSV |
-| `sn_brand` | SN: Brand | string | CSV |
-| `sn_source_name` | SN: Source Name | string | CSV |
-| `sn_source_platform` | SN: Source Platform | string | CSV |
-| `sn_created_at` | SN: Record Created At | date | CSV |
-
-### LICENSE (6 properties)
-
-| Property Name | Label | Type | Source |
-|---|---|---|---|
-| `sn_license_id` | SN: License ID | string | CSV |
-| `sn_license_number` | SN: License Number | string | CSV |
-| `sn_license_state` | SN: License State | string | CSV |
-| `sn_profession` | SN: Profession | string | CSV |
-| `sn_license_issued_date` | SN: License Issued Date | date | CSV |
-| `sn_est_renewal_date` | SN: Estimated Renewal Date | date | CSV |
-
-### LMS ENGAGEMENT (6 properties)
-
-| Property Name | Label | Type | Source |
-|---|---|---|---|
-| `sn_course_id` | SN: Course ID | string | CSV |
-| `sn_course_title` | SN: Course Title | string | CSV |
-| `sn_lms_completion_status` | SN: LMS Completion Status | string | CSV |
-| `sn_credits_earned` | SN: LMS Credits Earned | number | CSV |
-| `sn_last_activity_date` | SN: Last LMS Activity Date | date | CSV |
-| `sn_lms_source` | SN: LMS Source | string | CSV |
-
-### PURCHASE HISTORY (7 properties)
-
-| Property Name | Label | Type | Source |
-|---|---|---|---|
-| `sn_order_id` | SN: Order ID | string | CSV |
-| `sn_product_name` | SN: Product Name | string | CSV |
-| `sn_product_category` | SN: Product Category | string | CSV |
-| `sn_order_amount` | SN: Order Amount ($) | number | CSV |
-| `sn_order_date` | SN: Order Date | date | CSV |
-| `sn_payment_status` | SN: Payment Status | string | CSV |
-| `sn_purchase_source` | SN: Purchase Source | string | CSV |
-
-### MEMBERSHIP (6 properties)
-
-| Property Name | Label | Type | Values |
-|---|---|---|---|
-| `sn_membership_status` | SN: Membership Status | enum | Active / Expired / Cancelled |
-| `sn_membership_tier` | SN: Membership Tier | string | Regular, Lite, etc. |
-| `sn_membership_cadence` | SN: Membership Billing Cadence | string | Annual, Monthly |
-| `sn_mem_brand` | SN: Membership Brand | string | |
-| `sn_mem_start_date` | SN: Membership Start Date | date | |
-| `sn_mem_end_date` | SN: Membership End Date | date | |
-
-### MARKETING CONSENT (4 properties)
-
-| Property Name | Label | Type | Values |
-|---|---|---|---|
-| `sn_channel` | SN: Marketing Channel | string | Email |
-| `sn_consent_status` | SN: Consent Status | enum | Opt-In / Opt-Out |
-| `sn_consent_brand` | SN: Consent Brand | string | |
-| `sn_consent_timestamp` | SN: Consent Timestamp | date | |
-
-### CE COMPLETION (4 properties)
-
-| Property Name | Label | Type | Values |
-|---|---|---|---|
-| `sn_ce_period` | SN: CE Period | string | Current Renewal |
-| `sn_credits_completed` | SN: CE Credits Completed | number | |
-| `sn_ce_status` | SN: CE Status | enum | Not Started / In Progress / Complete |
-| `sn_ce_period_end_date` | SN: CE Period End Date | date | |
-
-### DIRECT MAIL (6 properties)
-
-| Property Name | Label | Type | Source |
-|---|---|---|---|
-| `sn_send_channel` | SN: Direct Mail Channel | string | CSV |
-| `sn_send_brand` | SN: Direct Mail Brand | string | CSV |
-| `sn_send_date` | SN: Direct Mail Send Date | date | CSV |
-| `sn_creative_version` | SN: Creative Version | string | CSV |
-| `sn_book_title_sent` | SN: Book Title Sent | string | CSV |
-| `sn_book_sent_date` | SN: Book Sent Date | date | CSV |
-
-### EXA ENRICHMENT (6 properties)
-
-| Property Name | Label | Type | Source |
-|---|---|---|---|
-| `sn_exa_employer` | SN: Employer (Exa) | string | Exa web search |
-| `sn_exa_specialty` | SN: Specialty (Exa) | string | Exa web search |
-| `sn_exa_npi` | SN: NPI Number (Exa) | string | Exa → NPI registry |
-| `sn_exa_profile_url` | SN: Professional Profile URL | string | Exa web search |
-| `sn_exa_profile_type` | SN: Profile Source (Exa) | string | LinkedIn / Doximity / NPI Registry |
-| `sn_exa_enriched_at` | SN: Exa Enriched At | string | pipeline timestamp |
-
----
-
-## 12. CSV Column → HubSpot Property Mapping
-
-| Section | CSV Column | HubSpot Property |
+| HubSpot Type | What it means | Example |
 |---|---|---|
-| PERSON | `resolved_person_id` | `sn_person_id` |
-| PERSON | `person_name` | `firstname` + `lastname` (split on last space) |
-| PERSON | `person_email` | `email` |
-| PERSON | `person_address` | `address` |
-| PERSON | `person_phone` | `phone` |
-| PERSON | `created_at` | `sn_created_at` |
-| PERSON SOURCE | `source_name` | `sn_source_name` |
-| PERSON SOURCE | `source_platform` | `sn_source_platform` |
-| PERSON SOURCE | `native_person_id` | `sn_native_id` |
-| PERSON SOURCE | `brand` | `sn_brand` |
-| LICENSE | `resolved_license_id` | `sn_license_id` |
-| LICENSE | `license_number` | `sn_license_number` + `license_number` (existing prop) |
-| LICENSE | `state` | `sn_license_state` + `license_state_abbreviation` (existing) |
-| LICENSE | `profession` | `sn_profession` |
-| LICENSE | `license_issued_date` | `sn_license_issued_date` |
-| LICENSE | `est_renewal_date` | `sn_est_renewal_date` + `education_renewal_date_us_nurses` (existing) |
-| LMS ENGAGEMENT | `course_id` | `sn_course_id` |
-| LMS ENGAGEMENT | `course_title` | `sn_course_title` |
-| LMS ENGAGEMENT | `completion_status` | `sn_lms_completion_status` |
-| LMS ENGAGEMENT | `credits_earned` | `sn_credits_earned` |
-| LMS ENGAGEMENT | `last_activity_date` | `sn_last_activity_date` |
-| LMS ENGAGEMENT | `lms_source` | `sn_lms_source` |
-| PURCHASE HISTORY | `order_id` | `sn_order_id` |
-| PURCHASE HISTORY | `product_name` | `sn_product_name` |
-| PURCHASE HISTORY | `product_category` | `sn_product_category` |
-| PURCHASE HISTORY | `order_amount` | `sn_order_amount` |
-| PURCHASE HISTORY | `order_date` | `sn_order_date` |
-| PURCHASE HISTORY | `payment_status` | `sn_payment_status` |
-| PURCHASE HISTORY | `purchase_source` | `sn_purchase_source` |
-| MEMBERSHIP | `membership_billing_cadence` | `sn_membership_cadence` |
-| MEMBERSHIP | `membership_tier` | `sn_membership_tier` |
-| MEMBERSHIP | `mem_brand` | `sn_mem_brand` |
-| MEMBERSHIP | `mem_start_date` | `sn_mem_start_date` |
-| MEMBERSHIP | `mem_end_date` | `sn_mem_end_date` + `membership_end_date` (existing) |
-| MEMBERSHIP | `mem_status` | `sn_membership_status` |
-| MARKETING CONSENT | `channel` | `sn_channel` |
-| MARKETING CONSENT | `consent_status` | `sn_consent_status` |
-| MARKETING CONSENT | `consent_brand` | `sn_consent_brand` |
-| MARKETING CONSENT | `consent_timestamp` | `sn_consent_timestamp` |
-| CE COMPLETION | `ce_period` | `sn_ce_period` |
-| CE COMPLETION | `credits_completed` | `sn_credits_completed` |
-| CE COMPLETION | `ce_status` | `sn_ce_status` |
-| CE COMPLETION | `period_end_date` | `sn_ce_period_end_date` |
-| DIRECT MAIL | `send_channel` | `sn_send_channel` |
-| DIRECT MAIL | `send_brand` | `sn_send_brand` |
-| DIRECT MAIL | `send_date` | `sn_send_date` |
-| DIRECT MAIL | `creative_version` | `sn_creative_version` |
-| DIRECT MAIL | `book_title_sent` | `sn_book_title_sent` |
-| DIRECT MAIL | `book_sent_date` | `sn_book_sent_date` |
-| SPECIALTY | `speciality` | `sn_specialty` (no data in POC file) |
-| SPECIALTY | `nurse_professions` | `sn_nurse_professions` (no data in POC file) |
+| `string` | Plain text | `"RN628427"` |
+| `number` | Numeric value | `39.0` |
+| `date` | Epoch milliseconds at midnight UTC | `1749686400000` |
+| `enumeration` | Dropdown with fixed options | `"Active"` / `"Expired"` |
 
-**Columns with no data in the POC file** (we create the property but it stays empty):
-`score`, `credits_required`, `send_id`, `campaign_name`, `response_flag`, `response_date`, `speciality`, `nurse_professions`
+> ⚠️ **Critical gotcha on dates:** HubSpot date fields do NOT accept `"2026-06-12"`. They require epoch milliseconds. Convert like this:
+> ```python
+> import calendar
+> from datetime import datetime
+> d = datetime(2026, 6, 12)
+> epoch_ms = int(calendar.timegm(d.timetuple()) * 1000)  # → 1749686400000
+> ```
+
+### All 51 Properties by Section
+
+```mermaid
+flowchart TD
+    GROUP["sn_enrichment\nProperty Group"]
+
+    GROUP --> P1 & P2 & P3 & P4 & P5 & P6 & P7 & P8 & P9 & P10
+
+    subgraph P1["👤 PERSON SOURCE (6)"]
+        direction LR
+        p1a["sn_person_id"] & p1b["sn_native_id"] & p1c["sn_brand"]
+        p1d["sn_source_name"] & p1e["sn_source_platform"] & p1f["sn_created_at"]
+    end
+
+    subgraph P2["🪪 LICENSE (6)"]
+        direction LR
+        p2a["sn_license_id"] & p2b["sn_license_number"] & p2c["sn_license_state"]
+        p2d["sn_profession"] & p2e["sn_license_issued_date"] & p2f["sn_est_renewal_date"]
+    end
+
+    subgraph P3["📚 LMS ENGAGEMENT (6)"]
+        direction LR
+        p3a["sn_course_id"] & p3b["sn_course_title"] & p3c["sn_lms_completion_status"]
+        p3d["sn_credits_earned"] & p3e["sn_last_activity_date"] & p3f["sn_lms_source"]
+    end
+
+    subgraph P4["🛒 PURCHASE HISTORY (7)"]
+        direction LR
+        p4a["sn_order_id"] & p4b["sn_product_name"] & p4c["sn_product_category"]
+        p4d["sn_order_amount"] & p4e["sn_order_date"] & p4f["sn_payment_status"] & p4g["sn_purchase_source"]
+    end
+
+    subgraph P5["💳 MEMBERSHIP (6)"]
+        direction LR
+        p5a["sn_membership_status\n(Active/Expired/Cancelled)"] & p5b["sn_membership_tier"] & p5c["sn_membership_cadence"]
+        p5d["sn_mem_brand"] & p5e["sn_mem_start_date"] & p5f["sn_mem_end_date"]
+    end
+
+    subgraph P6["📬 MARKETING CONSENT (4)"]
+        direction LR
+        p6a["sn_channel"] & p6b["sn_consent_status\n(Opt-In/Opt-Out)"]
+        p6c["sn_consent_brand"] & p6d["sn_consent_timestamp"]
+    end
+
+    subgraph P7["🎓 CE COMPLETION (4)"]
+        direction LR
+        p7a["sn_ce_period"] & p7b["sn_credits_completed"]
+        p7c["sn_ce_status\n(Not Started/In Progress/Complete)"] & p7d["sn_ce_period_end_date"]
+    end
+
+    subgraph P8["📮 DIRECT MAIL (6)"]
+        direction LR
+        p8a["sn_send_channel"] & p8b["sn_send_brand"] & p8c["sn_send_date"]
+        p8d["sn_creative_version"] & p8e["sn_book_title_sent"] & p8f["sn_book_sent_date"]
+    end
+
+    subgraph P9["🔍 EXA ENRICHMENT (6)"]
+        direction LR
+        p9a["sn_exa_employer"] & p9b["sn_exa_specialty"] & p9c["sn_exa_npi"]
+        p9d["sn_exa_profile_url"] & p9e["sn_exa_profile_type"] & p9f["sn_exa_enriched_at"]
+    end
+
+    subgraph P10["🕐 META (1)"]
+        p10a["sn_enriched_at"]
+    end
+
+    style GROUP fill:#E91E63,color:#fff,stroke:#C2185B
+    style P1 fill:#e3f2fd,stroke:#1976D2
+    style P2 fill:#e8f5e9,stroke:#388E3C
+    style P3 fill:#fff8e1,stroke:#F9A825
+    style P4 fill:#fce4ec,stroke:#C2185B
+    style P5 fill:#f3e5f5,stroke:#7B1FA2
+    style P6 fill:#e0f2f1,stroke:#00796B
+    style P7 fill:#fff3e0,stroke:#E65100
+    style P8 fill:#fafafa,stroke:#616161
+    style P9 fill:#e8eaf6,stroke:#3949AB
+    style P10 fill:#efebe9,stroke:#5D4037
+```
+
+> These properties also cross-map to existing standard HubSpot fields:
+> - `sn_license_number` → also writes `license_number`
+> - `sn_est_renewal_date` → also writes `education_renewal_date_us_nurses`
+> - `sn_mem_end_date` → also writes `membership_end_date`
+> - `sn_license_state` → also writes `license_state_abbreviation`
 
 ---
 
-## 13. APIs Used — Full Reference
+<br>
+
+## 10. CSV → HubSpot Mapping
+
+```mermaid
+flowchart LR
+    subgraph CSV["📄 CSV Columns"]
+        c1["resolved_person_id"]
+        c2["person_name"]
+        c3["person_email"]
+        c4["person_address"]
+        c5["person_phone"]
+        c6["created_at"]
+        c7["source_name"]
+        c8["native_person_id"]
+        c9["brand"]
+        c10["license_number"]
+        c11["state"]
+        c12["est_renewal_date"]
+        c13["mem_status"]
+        c14["credits_completed"]
+        c15["ce_status"]
+        c16["order_amount"]
+        c17["send_date"]
+    end
+
+    subgraph HS["🟠 HubSpot Properties"]
+        h1["sn_person_id"]
+        h2["firstname + lastname"]
+        h3["email"]
+        h4["address"]
+        h5["phone"]
+        h6["sn_created_at"]
+        h7["sn_source_name"]
+        h8["sn_native_id"]
+        h9["sn_brand"]
+        h10["sn_license_number"]
+        h11["sn_license_state"]
+        h12["sn_est_renewal_date"]
+        h13["sn_membership_status"]
+        h14["sn_credits_completed"]
+        h15["sn_ce_status"]
+        h16["sn_order_amount"]
+        h17["sn_send_date"]
+    end
+
+    c1 --> h1
+    c2 --> h2
+    c3 --> h3
+    c4 --> h4
+    c5 --> h5
+    c6 --> h6
+    c7 --> h7
+    c8 --> h8
+    c9 --> h9
+    c10 --> h10
+    c11 --> h11
+    c12 --> h12
+    c13 --> h13
+    c14 --> h14
+    c15 --> h15
+    c16 --> h16
+    c17 --> h17
+```
+
+### Full Mapping Table
+
+| Section | CSV Column | HubSpot Property | Type | Notes |
+|---|---|---|---|---|
+| PERSON | `resolved_person_id` | `sn_person_id` | string | |
+| PERSON | `person_name` | `firstname` + `lastname` | string | Split on last space |
+| PERSON | `person_email` | `email` | string | Lowercased |
+| PERSON | `person_address` | `address` | string | |
+| PERSON | `person_phone` | `phone` | string | |
+| PERSON | `created_at` | `sn_created_at` | date | → epoch ms |
+| PERSON SOURCE | `source_name` | `sn_source_name` | string | |
+| PERSON SOURCE | `source_platform` | `sn_source_platform` | string | e.g. NetSuite |
+| PERSON SOURCE | `native_person_id` | `sn_native_id` | string | e.g. CUS5089562 |
+| PERSON SOURCE | `brand` | `sn_brand` | string | e.g. Elite |
+| LICENSE | `resolved_license_id` | `sn_license_id` | string | |
+| LICENSE | `license_number` | `sn_license_number` + `license_number` | string | dual-write |
+| LICENSE | `state` | `sn_license_state` + `license_state_abbreviation` | string | dual-write |
+| LICENSE | `profession` | `sn_profession` | string | |
+| LICENSE | `license_issued_date` | `sn_license_issued_date` | date | → epoch ms |
+| LICENSE | `est_renewal_date` | `sn_est_renewal_date` + `education_renewal_date_us_nurses` | date | dual-write |
+| LMS | `course_id` | `sn_course_id` | string | |
+| LMS | `course_title` | `sn_course_title` | string | |
+| LMS | `completion_status` | `sn_lms_completion_status` | string | |
+| LMS | `credits_earned` | `sn_credits_earned` | number | ⚠️ 0 is valid |
+| LMS | `last_activity_date` | `sn_last_activity_date` | date | → epoch ms |
+| LMS | `lms_source` | `sn_lms_source` | string | |
+| PURCHASE | `order_id` | `sn_order_id` | string | |
+| PURCHASE | `product_name` | `sn_product_name` | string | |
+| PURCHASE | `product_category` | `sn_product_category` | string | |
+| PURCHASE | `order_amount` | `sn_order_amount` | number | ⚠️ 0 is valid |
+| PURCHASE | `order_date` | `sn_order_date` | date | → epoch ms |
+| PURCHASE | `payment_status` | `sn_payment_status` | string | |
+| PURCHASE | `purchase_source` | `sn_purchase_source` | string | |
+| MEMBERSHIP | `membership_billing_cadence` | `sn_membership_cadence` | string | |
+| MEMBERSHIP | `membership_tier` | `sn_membership_tier` | string | |
+| MEMBERSHIP | `mem_brand` | `sn_mem_brand` | string | |
+| MEMBERSHIP | `mem_start_date` | `sn_mem_start_date` | date | → epoch ms |
+| MEMBERSHIP | `mem_end_date` | `sn_mem_end_date` + `membership_end_date` | date | dual-write |
+| MEMBERSHIP | `mem_status` | `sn_membership_status` | enum | Active/Expired/Cancelled |
+| CONSENT | `channel` | `sn_channel` | string | |
+| CONSENT | `consent_status` | `sn_consent_status` | enum | Opt-In/Opt-Out |
+| CONSENT | `consent_brand` | `sn_consent_brand` | string | |
+| CONSENT | `consent_timestamp` | `sn_consent_timestamp` | date | → epoch ms |
+| CE | `ce_period` | `sn_ce_period` | string | |
+| CE | `credits_completed` | `sn_credits_completed` | number | ⚠️ 0 is valid |
+| CE | `ce_status` | `sn_ce_status` | enum | Not Started/In Progress/Complete |
+| CE | `period_end_date` | `sn_ce_period_end_date` | date | → epoch ms |
+| DIRECT MAIL | `send_channel` | `sn_send_channel` | string | |
+| DIRECT MAIL | `send_brand` | `sn_send_brand` | string | |
+| DIRECT MAIL | `send_date` | `sn_send_date` | date | → epoch ms |
+| DIRECT MAIL | `creative_version` | `sn_creative_version` | string | |
+| DIRECT MAIL | `book_title_sent` | `sn_book_title_sent` | string | |
+| DIRECT MAIL | `book_sent_date` | `sn_book_sent_date` | date | → epoch ms |
+| SPECIALTY | `speciality` | `sn_specialty` | string | No data in POC |
+| SPECIALTY | `nurse_professions` | `sn_nurse_professions` | string | No data in POC |
+
+---
+
+<br>
+
+## 11. APIs — Full Reference
 
 ### HubSpot API
 
-**Base URL:** `https://api.hubapi.com`
+```mermaid
+flowchart TD
+    HS["HubSpot API\nhttps://api.hubapi.com\nAuth: Authorization: Bearer pat-na1-..."]
 
-**Auth header:** `Authorization: Bearer pat-na1-xxxxx...`
+    HS --> A["Check portal info\nGET /integrations/v1/me"]
+    HS --> B["List contacts\nGET /crm/v3/objects/contacts"]
+    HS --> C["Get one contact by email\nGET /crm/v3/objects/contacts/{email}\n?idProperty=email"]
+    HS --> D["★ Batch upsert contacts\nPOST /crm/v3/objects/contacts/batch/upsert\nCreates OR updates — the key endpoint"]
+    HS --> E["Create property group\nPOST /crm/v3/properties/contacts/groups"]
+    HS --> F["Create custom property\nPOST /crm/v3/properties/contacts"]
+    HS --> G["List all properties\nGET /crm/v3/properties/contacts?limit=500"]
 
-| What | Method | Endpoint |
-|---|---|---|
-| List contacts | GET | `/crm/v3/objects/contacts?properties=email,firstname` |
-| Get one contact by email | GET | `/crm/v3/objects/contacts/{email}?idProperty=email` |
-| **Batch upsert contacts** | POST | `/crm/v3/objects/contacts/batch/upsert` |
-| Create a contact property | POST | `/crm/v3/properties/contacts` |
-| List all contact properties | GET | `/crm/v3/properties/contacts?limit=500` |
-| Create a property group | POST | `/crm/v3/properties/contacts/groups` |
-| List property groups | GET | `/crm/v3/properties/contacts/groups` |
-| Check your portal info | GET | `/integrations/v1/me` |
+    style D fill:#4CAF50,color:#fff,stroke:#388E3C
+```
 
-**Batch upsert payload format:**
-```json
-{
-  "inputs": [
-    {
-      "id": "email@example.com",
-      "idProperty": "email",
-      "properties": {
-        "email": "email@example.com",
-        "firstname": "Jane",
-        "sn_license_number": "RN123456"
-      }
+**Batch upsert — the most important API call:**
+
+```python
+response = requests.post(
+    "https://api.hubapi.com/crm/v3/objects/contacts/batch/upsert",
+    headers={"Authorization": "Bearer pat-na1-...", "Content-Type": "application/json"},
+    json={
+        "inputs": [
+            {
+                "id": "jane@example.com",      # match on this value
+                "idProperty": "email",          # match using this field
+                "properties": {                 # set all these fields
+                    "email": "jane@example.com",
+                    "firstname": "Jane",
+                    "sn_license_number": "RN123456",
+                    "sn_ce_status": "In Progress",
+                    "sn_order_amount": 99.99
+                }
+            }
+            # up to 100 contacts per call
+        ]
     }
-  ]
-}
-```
-- Max 100 contacts per batch call
-- Returns 200 with results array on success
-- `id` in the response is the HubSpot contact ID (e.g., `228719219593`)
-
-**Property creation payload:**
-```json
-{
-  "name": "sn_license_number",
-  "label": "SN: License Number",
-  "type": "string",
-  "fieldType": "text",
-  "groupName": "sn_enrichment"
-}
+)
+# 200 = success. Check response["results"] for individual outcomes.
 ```
 
-For **enumeration** (dropdown) properties, add an `options` array:
-```json
-{
-  "name": "sn_membership_status",
-  "label": "SN: Membership Status",
-  "type": "enumeration",
-  "fieldType": "select",
-  "groupName": "sn_enrichment",
-  "options": [
-    {"label": "Active",    "value": "Active",    "displayOrder": 0},
-    {"label": "Expired",   "value": "Expired",   "displayOrder": 1},
-    {"label": "Cancelled", "value": "Cancelled", "displayOrder": 2}
-  ]
-}
-```
+**Create a property:**
 
-For **date** properties, HubSpot expects **epoch milliseconds at midnight UTC**:
 ```python
-import calendar
-from datetime import datetime
-d = datetime(2026, 6, 12)
-epoch_ms = int(calendar.timegm(d.timetuple()) * 1000)  # → 1749686400000
+requests.post(
+    "https://api.hubapi.com/crm/v3/properties/contacts",
+    headers={"Authorization": "Bearer pat-na1-..."},
+    json={
+        "name": "sn_license_number",
+        "label": "SN: License Number",
+        "type": "string",           # string | number | date | enumeration
+        "fieldType": "text",        # text | number | date | select
+        "groupName": "sn_enrichment"
+    }
+)
 ```
-Do NOT send a string like `"2026-06-12"` for date fields — it won't work.
-
-**Important gotcha — zero values:**
-```python
-# WRONG — Python treats 0 as falsy, so this skips zero values
-if v := to_num(row.get("credits_earned")):
-    p["sn_credits_earned"] = v   # ← 0 never gets set!
-
-# CORRECT — check for None explicitly
-v = to_num(row.get("credits_earned"))
-if v is not None:
-    p["sn_credits_earned"] = v   # ← 0 gets set correctly
-```
-We hit this bug for `order_amount = 0` and `credits_earned = 0`. Fixed in `push_all.py`.
 
 ---
 
 ### FullEnrich API
 
-**Base URL:** `https://app.fullenrich.com/api/v1`
+**What it does:** Give it emails → it finds their LinkedIn profiles.
+**Why 0 hits for us:** Our nurses use personal emails (Yahoo, Gmail, Hotmail). FullEnrich works for corporate emails like `jane@hospital.com`.
 
-**Auth header:** `Authorization: Bearer YOUR_KEY`
+```mermaid
+sequenceDiagram
+    participant Python
+    participant FullEnrich
 
-FullEnrich is a **LinkedIn enrichment** tool. Give it a LinkedIn URL → it returns email and phone. Or give it emails → it finds their LinkedIn profiles (**reverse lookup**).
+    Python->>FullEnrich: POST /contact/reverse/email/bulk
+    Note over Python,FullEnrich: {"name": "batch-1", "data": [{"email": "..."}]}
+    FullEnrich-->>Python: {"enrichment_id": "abc-123"}
 
-| What | Method | Endpoint |
-|---|---|---|
-| Check credits | GET | `/account/credits` |
-| Start bulk reverse lookup (email → LinkedIn) | POST | `/contact/reverse/email/bulk` |
-| Poll reverse lookup status | GET | `/contact/reverse/email/bulk/{reverse_id}` |
-| Start LinkedIn enrichment (LinkedIn → email) | POST | `/contact/enrich/bulk` |
-| Poll enrichment status | GET | `/contact/enrich/bulk/{enrichment_id}` |
+    loop Poll every 10 seconds
+        Python->>FullEnrich: GET /contact/reverse/email/bulk/abc-123
+        FullEnrich-->>Python: {"status": "IN_PROGRESS"}
+    end
 
-**Reverse lookup payload:**
-```json
-{
-  "name": "my-lookup-name",
-  "data": [
-    {"email": "jane@example.com"},
-    {"email": "bob@yahoo.com"}
-  ]
-}
+    FullEnrich-->>Python: {"status": "FINISHED", "results": [...]}
 ```
-
-**Poll until status = "FINISHED"** — it's async, usually takes 30–60 seconds.
-
-**Note:** FullEnrich works best for B2B professional emails (company domains). For B2C emails (Gmail, Yahoo, Hotmail), it returns 0 results. Our nursing contacts use personal emails so we got 0/20 matches.
 
 ---
 
 ### Exa API
 
-**Base URL:** `https://api.exa.ai`
-
-**Auth header:** `x-api-key: YOUR_KEY`
-
-Exa is a **semantic web search API** — smarter than Google for finding specific people.
-
-| What | Method | Endpoint |
-|---|---|---|
-| Search | POST | `/search` |
-
-**Search payload:**
-```json
-{
-  "query": "Deborah Lynn Dawson registered nurse Texas",
-  "num_results": 5,
-  "type": "neural",
-  "use_autoprompt": false,
-  "include_domains": ["linkedin.com", "doximity.com", "opennpi.com", "opengovus.com", "npino.com"],
-  "contents": {
-    "text": {"max_characters": 800}
-  }
-}
-```
-
-**Response structure:**
-```json
-{
-  "results": [
-    {
-      "title": "Deborah Dawson — NPI Registry",
-      "url": "https://npino.com/nurse/1972630978-debra-d-dawson/",
-      "score": 1.0,
-      "text": "Deborah D Dawson... specialization is Registered Nurse - Psych/mental Health..."
-    }
-  ],
-  "costDollars": {"total": 0.007}
-}
-```
-
-**Cost:** $0.007 per search. For 20 nurses × 2 searches = $0.28.
-
----
-
-## 14. Phase 2: S3 Pipeline (Coming Next)
-
-### What changes at 17M scale
-
-The Excel/CSV approach works for 20 records. For 17 million:
-
-1. **File size** — the S3 file will be huge. We need to read it in **chunks** (e.g., 10,000 rows at a time)
-2. **Delta sync** — we can't re-push all 17M every run. We need to track `last_sync_timestamp` and only push records where something changed
-3. **Rate limits** — HubSpot allows ~100 req/s on paid plans. At 100 contacts per batch = 10,000 contacts/second theoretical max
-4. **Orchestration** — Airflow will trigger the pipeline on a schedule (e.g., weekly Monday)
-
-### S3 access
-
-Jira ticket **COT-6043** (assigned to Prakhar Jadon) requests these credentials:
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `AWS_DEFAULT_REGION=us-east-1`
-
-Scoped to: `s3://prod-data-warehouse-redshift-cdp-data-lake-us-east-1/entity_matching/segmentation_flatview/`
-
-First file: `hc_ce_renewal_segmentation_flatview_000.csv`
-
-### How to read from S3 once you have credentials
+**What it does:** Semantic web search — finds nurses by name+state across LinkedIn, Doximity, NPI registries.
+**Cost:** ~$0.007 per search. 20 nurses = $0.14.
 
 ```python
-import boto3
-
-s3 = boto3.client(
-    "s3",
-    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-    region_name="us-east-1"
+response = requests.post(
+    "https://api.exa.ai/search",
+    headers={"x-api-key": "your-exa-key"},
+    json={
+        "query": "Deborah Lynn Dawson registered nurse Texas",
+        "num_results": 5,
+        "type": "neural",
+        "include_domains": [
+            "linkedin.com",
+            "doximity.com",
+            "opennpi.com",       # NPI registry with employer data
+            "opengovus.com",     # Government license records
+            "npino.com"          # NPI with specialty info
+        ],
+        "contents": {"text": {"max_characters": 800}}
+    }
 )
 
-# List files in the prefix
-response = s3.list_objects_v2(
-    Bucket="prod-data-warehouse-redshift-cdp-data-lake-us-east-1",
-    Prefix="entity_matching/segmentation_flatview/"
-)
-for obj in response["Contents"]:
-    print(obj["Key"])
-
-# Download the file
-s3.download_file(
-    "prod-data-warehouse-redshift-cdp-data-lake-us-east-1",
-    "entity_matching/segmentation_flatview/hc_ce_renewal_segmentation_flatview_000.csv",
-    "/local/path/output.csv"
-)
+# Each result has: title, url, score (0-1), text (extracted content)
+# We parse the text for: NPI number, employer name, specialty keywords
 ```
 
-Install boto3: `uv pip install boto3`
+**What we found for our 20 nurses:**
+
+| Nurse | Found |
+|---|---|
+| Deborah Dawson | NPI `1972630978` · Specialty: **Psychiatric** |
+| Renee Hanson | **LinkedIn profile** · Employer: Halifax Health Medical Center |
+| Tina King-Pemberton | NPI `1013330109` · **Family NP** specialty |
+| Corazon Barcelona | NPI + **Acute Care** + LinkedIn |
+| Tosha Vaughn | NPI + **Pediatric** specialty |
+| Shawn Taylor | NPI + **Home Health** specialty |
 
 ---
 
-## 15. Troubleshooting
+<br>
 
-### "This app hasn't been granted all required scopes"
-Your HubSpot token is missing permissions. Go to HubSpot → Settings → Integrations → Private Apps → your app → Scopes tab, and add `crm.objects.contacts.write` and `crm.schemas.contacts.write`.
+## 12. Phase 2 — S3 at Scale
 
-### "resource not found" (404) when upserting contacts
-You're using `PATCH` to update a contact that doesn't exist yet. Switch to the **batch upsert** endpoint (`POST /crm/v3/objects/contacts/batch/upsert`) which creates-or-updates in one call.
+### Current Status
 
-### Properties show as "None" in HubSpot
-- Check the date format — HubSpot dates must be epoch milliseconds, not strings
-- Check for zero values — use `if v is not None:` not `if v:` for numbers
-
-### FullEnrich returns 0 results
-Expected for personal emails (Gmail, Yahoo, Hotmail). FullEnrich works for corporate email domains. Use Exa instead for finding NPI/profile from name+state.
-
-### "Please select from an Initiative" when creating Jira ticket
-The COT project requires an Initiative field. Must use `{"id": "XXXXX"}` format (not `[{...}]` array). Get the id by calling:
+```mermaid
+flowchart LR
+    A["✅ Phase 1 Complete\n20 contacts\nHubSpot sandbox\n51 properties validated"] -->|"COT-6043\nresolved by\nPrakhar Jadon"| B["🔜 Phase 2\n17M contacts\nHubSpot production\nWeekly Airflow sync"]
 ```
-GET /rest/api/3/issue/createmeta?projectKeys=COT&issuetypeIds=3&expand=projects.issuetypes.fields
+
+### The Jira Ticket
+
+| Field | Value |
+|---|---|
+| **Ticket** | [COT-6043](https://colibrigroup.atlassian.net/browse/COT-6043) |
+| **Assigned to** | Prakhar Jadon |
+| **Watching** | Austin Ellingwood |
+| **Priority** | Critical |
+| **Initiative** | 375 — Build Segments/Audiences leveraging Data Warehouse |
+
+DevOps will provide `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` via 1Password. Set them in `.env`.
+
+### S3 Path
+
+```
+Bucket:  prod-data-warehouse-redshift-cdp-data-lake-us-east-1
+Prefix:  entity_matching/segmentation_flatview/
+File:    hc_ce_renewal_segmentation_flatview_000.csv
+Region:  us-east-1
+```
+
+### Phase 2 Architecture
+
+```mermaid
+flowchart TD
+    A["Airflow DAG\nSchedule: Monday 6am"] --> B["s3_pipeline.py\n(to be built)"]
+
+    B --> C["1. List files in S3 prefix"]
+    C --> D["2. Download CSV chunk\n10,000 rows at a time"]
+    D --> E["3. Delta check\nCompare with last_synced_at\nSkip unchanged records"]
+    E --> F{New or\nchanged?}
+    F -->|Yes| G["4. Build HubSpot payload\nSame mapping as Phase 1"]
+    F -->|No| H["Skip — save API calls"]
+    G --> I["5. Batch upsert\n100 contacts per API call"]
+    I --> J{More chunks?}
+    J -->|Yes| D
+    J -->|No| K["6. Log completion\nUpdate sync timestamp"]
+
+    style A fill:#ff7043,color:#fff,stroke:#e64a19
+    style E fill:#fff9c4,stroke:#f9a825
+    style F fill:#e3f2fd,stroke:#1976D2
+    style I fill:#e8f5e9,stroke:#388E3C
+```
+
+**Why delta sync?** At 17M records, pushing everything every time would:
+- Take ~47 hours at 100 contacts/second
+- Cost significant HubSpot API quota
+- Be wasteful — most records don't change week-to-week
+
+Delta sync = only push records where something changed since last run.
+
+---
+
+<br>
+
+## 13. Troubleshooting
+
+```mermaid
+flowchart TD
+    ERROR["Got an error?"] --> A & B & C & D & E
+
+    A["403 — Missing scopes"]
+    A --> A1["Go to HubSpot → Private Apps\nAdd crm.objects.contacts.write\nand crm.schemas.contacts.write"]
+
+    B["404 — resource not found\n(on PATCH)"]
+    B --> B1["You used PATCH on a contact\nthat doesn't exist yet.\nSwitch to batch/upsert endpoint:\nPOST .../contacts/batch/upsert"]
+
+    C["Property shows None\nor date is wrong"]
+    C --> C1["Date issue: use epoch ms not string\nimport calendar\nepoch = calendar.timegm(d.timetuple()) * 1000"]
+    C --> C2["Zero value issue: use\nif v is not None:\nnot just\nif v:"]
+
+    D["FullEnrich returns 0 results"]
+    D --> D1["Expected for personal emails\n(Gmail, Yahoo, Hotmail)\nUse Exa for these contacts instead"]
+
+    E["ERROR: CSV_FILE not set"]
+    E --> E1["Your .env file is missing CSV_FILE\nSet it to the full path of\nHC_CE_Renewal_Nursing_Specialty_3\n(Nursing_Flat_File).csv"]
+
+    style ERROR fill:#f44336,color:#fff,stroke:#d32f2f
+    style A fill:#fff3e0,stroke:#FF9800
+    style B fill:#fff3e0,stroke:#FF9800
+    style C fill:#fff3e0,stroke:#FF9800
+    style D fill:#fff3e0,stroke:#FF9800
+    style E fill:#fff3e0,stroke:#FF9800
 ```
 
 ---
 
-## People
+<br>
 
-| Name | Role | Contact |
+## 14. People & Contacts
+
+| Name | Role | Email |
 |---|---|---|
-| Sam Chaudhary | GTM Engineering (project lead) | sam.chaudhary@colibrigroup.com |
-| Aliza John | Intern (you!) | — |
-| Madhankumar Pillay | Product owner | — |
-| Veena Anantharam | Data architecture | — |
-| Sandesh Segu | Data engineering | — |
-| Prakhar Jadon | DevOps (S3 access owner) | COT-6043 assignee |
-| Austin Ellingwood | DevOps (cc) | — |
+| **Sam Chaudhary** | GTM Engineering — project lead | sam.chaudhary@colibrigroup.com |
+| **Aliza John** | Intern — that's you! | — |
+| **Madhankumar Pillay** | Product owner | — |
+| **Prabhu** | Senior leadership | — |
+| **Veena Anantharam** | Data architecture | — |
+| **Sandesh Segu** | Data engineering | — |
+| **Prakhar Jadon** | DevOps — S3 access (COT-6043) | — |
+| **Austin Ellingwood** | DevOps — cc on COT-6043 | — |
 
 ---
 
-*Built by Sam Chaudhary with Claude Code. Questions? Open an issue or ping Sam directly.*
+<br>
+
+## Quick Reference Card
+
+| What | Command |
+|---|---|
+| Dry run (safe test) | `python3 enrich.py --dry-run --skip-fullenrich` |
+| Push contacts | `python3 enrich.py --skip-fullenrich` |
+| Push all 57 fields | `python3 push_all.py` |
+| Web enrichment | `python3 exa_enrich.py` |
+| Verify everything | `python3 verify_all.py` |
+| Update CSV | `python3 build_csv.py` |
+| Audit field counts | `python3 audit.py` |
+| Check portal info | `curl -s https://api.hubapi.com/integrations/v1/me -H "Authorization: Bearer $HUBSPOT_API_KEY"` |
+
+---
+
+<br>
+
+> *Built by Sam Chaudhary with Claude Code.*
+> *Questions? Open an issue on this repo or email sam.chaudhary@colibrigroup.com*
